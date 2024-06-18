@@ -664,8 +664,17 @@ fn cmd_count_occurrences(fpath: &String, querypath: &String, print_location: boo
     assert!(size_table % size_text == 0);
     let size_width = size_table / size_text;
 
+    let all_occurrences = get_occurrences_memory(&text, size_text, &table, size_table, &str, size_width.try_into().unwrap());
+    println!("OCCURENCES {:?}", all_occurrences);
+    let size_object_path = format!("{}.size", fpath);
+    let size_object = load_size_object(&size_object_path);
+    let doc_occurrences: Vec<usize> = all_occurrences.iter().map(|x| doc_lookup(*x, &size_object)).collect();
+    println!("DOCS {:?}", doc_occurrences);
+
+
     occurances = count_occurances_memory(&text, size_text,  &table, size_table, &str[0..str.len()], size_width as usize, print_location);
     }
+
 
     println!("Number of times present: {}\n", occurances);
     Ok(())
@@ -1631,4 +1640,135 @@ fn main()  -> std::io::Result<()> {
     }
     
     Ok(())
+}
+
+
+/*=======================================================
+=                      MJ EDITS                         =
+=======================================================*/
+
+
+fn load_for_mj(fpath: &String) -> (Vec<u8>, u64, Vec<u8>, u64, usize) {
+    // Loads everything we need to get lookups (should be done once!)
+    // output is (text, size_text, table, size_table, size_width)
+    let metadata_text = fs::metadata(format!("{}", fpath)).unwrap();
+    let metadata_table = fs::metadata(format!("{}.table.bin", fpath)).unwrap();
+    let size_text = metadata_text.len();
+    let size_table = metadata_table.len();
+    assert!(size_table % (size_text) == 0);
+    let size_width: usize = (size_table / size_text).try_into().unwrap();
+
+    let mut text = Vec::with_capacity(size_text as usize);
+    fs::File::open(format!("{}", fpath)).unwrap().read_to_end(&mut text).unwrap();
+
+    let mut table = Vec::with_capacity(size_table as usize);
+    fs::File::open(format!("{}.table.bin", fpath)).unwrap().read_to_end(&mut table).unwrap();    
+    (text, size_text, table, size_table, size_width)
+}
+
+fn load_size_object(size_object_path: &String) -> Vec<u64> {
+    // Loads the size object as a Vec<u64> 
+    // This is basically a cumsum of size in bytes for all objects
+    // (we want to binary search to find the document containing a particular index
+    let mut binary_data = Vec::new();
+    fs::File::open(size_object_path).unwrap().read_to_end(&mut binary_data).unwrap();
+    // Convert the binary data to a Vec<u64>
+    let sizes: Vec<u64> = binary_data
+        .chunks_exact(std::mem::size_of::<u64>())
+        .map(|chunk| u64::from_ne_bytes(chunk.try_into().unwrap()))
+        .collect();
+    sizes
+}
+
+fn doc_lookup(pos: u64, size_object: &Vec<u64>) -> usize {
+    // Given a position in the text, gets the doc id containing it 
+    let mut low = 0;
+    let mut high = size_object.len();
+
+    while low < high {
+        let mid = (high+low) / 2;
+        let idx = size_object[mid];
+
+        if idx <= pos {
+            if mid == size_object.len() -1 || size_object[mid+1] > pos {
+                return mid
+            }
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
+}
+
+
+fn get_occurrences_memory(text: &[u8],
+                          size_text: u64,
+                          table: &[u8],
+                          size_table: u64,
+                          query: &[u8],
+                          size_width: usize) -> Vec<u64> {
+    // Hack of count_occurrences. :vomit-emoji:
+    // Actually gets the positions in text of where the query occurs
+    let mut buf: &[u8];
+    assert!(size_table % (size_width as u64) == 0);
+    let empty_output : Vec<u64> = Vec::new();
+    let mut low = 0;
+    let mut high = size_table/(size_width as u64);
+    while low < high {
+        // binary search 1, find the first occurrence of str
+        let mid = (high+low)/2;
+        let pos = table_load(&table, mid as usize, size_width);
+
+        if pos + query.len() < size_text as usize {
+            buf = &text[pos..pos+query.len()];
+        } else {
+            buf = &text[pos..size_text as usize];
+        }
+
+        if query <= &buf {
+            high = mid;
+        } else {
+            low = mid+1;
+        }
+    }
+    if low == size_table/(size_width as u64) {
+        return empty_output;
+    }
+
+    let start = low;
+
+    let pos = table_load(&table, low as usize, size_width);
+    if pos + query.len() < size_text as usize {
+        buf = &text[pos..pos+query.len()];
+    } else {
+        buf = &text[pos..size_text as usize];
+    }
+
+    if query != buf {
+        return empty_output; // not found
+    }
+    
+    high = size_table/(size_width as u64);
+    while low < high {
+        // binsearch 2, find the last occurrence
+        let mid = (high+low)/2;
+        let pos = table_load(&table, mid as usize, size_width);
+
+        if pos + query.len() < size_text as usize {
+            buf = &text[pos..pos+query.len()];
+        } else {
+            buf = &text[pos..size_text as usize];
+        }
+
+        if query != buf {
+            high = mid;
+        } else {
+            low = mid+1;
+        }
+    }
+
+    (start..low)
+        .map(|idx| table_load(&table, idx as usize, size_width) as u64)
+        .collect()   
 }
